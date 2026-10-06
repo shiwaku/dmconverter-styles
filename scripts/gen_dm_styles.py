@@ -4,7 +4,8 @@
 - 点（E5記号・E6方向）: dm-sprite（https://github.com/shiwaku/dm-sprite）の SVG を分類コードで
   切り替える。SVG は base64 で埋め込むので、QML と出力 QLR は SVG ファイル無しで表示できる。
   アイコンの無いコード（拡張DMコードを含む）は灰色の丸で描く
-- 線（E2）: 黒線。歩道は破線、等高線・凹地は細線、建物は太線
+  縮尺が --point-max-scale より小さい（分母が大きい）ときは記号を描かない
+- 線（E2）: 黒線を基本に、境界・道路・鉄道・建物・水部・地類界・等高線などを線幅と線種で描き分ける
 - 面（E1）: 塗りなし＋黒の輪郭（線と重ねる前提）
 
 dmconverter の制約に合わせている点:
@@ -17,7 +18,7 @@ dmconverter の制約に合わせている点:
 - 注記（E7）は dmconverter がラベルを直接設定し QML を当てないため、ここでは作らない
 
 使い方（QGIS 同梱の Python で実行）:
-    python-qgis.bat scripts/gen_dm_styles.py [--icon-size 9]
+    python-qgis.bat scripts/gen_dm_styles.py [--icon-size 9] [--point-max-scale 10000]
 
     icons/（dm-*.svg）と data/icons.csv を読み、styles/ に
     dm_point.qml・dm_line.qml・dm_polygon.qml を書き出す。
@@ -30,7 +31,6 @@ import os
 import sys
 
 from qgis.core import (
-    Qgis,
     QgsApplication,
     QgsCategorizedSymbolRenderer,
     QgsFillSymbol,
@@ -40,6 +40,7 @@ from qgis.core import (
     QgsRendererCategory,
     QgsSymbolLayer,
     QgsSvgMarkerSymbolLayer,
+    QgsUnitTypes,
     QgsVectorLayer,
 )
 
@@ -53,11 +54,23 @@ FALLBACK_SVG = (
     '<circle cx="32" cy="32" r="7" fill="#808080"/></svg>'
 )
 
-# 線の描き分け（dm-converter の 都市計画基本図_線.qml と同じ。凹地の等高線も細線にする）
+# 線の描き分け（公共測量標準図式の分類コード）。上から順に判定し、どれにも当たらないコードは
+# 「その他」（黒 0.2mm の実線）。地下・トンネル・建設中は道路・鉄道より先に判定する
 LINE_GROUPS = [
-    ("歩道", ["2213"], {"line_style": "dash"}),
-    ("等高線", ["7101", "7102", "7103", "7104", "7105", "7106", "7107"], {"line_width": "0.15"}),
-    ("建物", ["3001", "3002", "3003", "3004"], {"line_width": "0.26"}),
+    ("境界", ["1101", "1102", "1103", "1104", "1106", "1107", "1110"],
+     {"line_style": "dash dot", "line_width": "0.25"}),
+    ("地下・トンネル・建設中", ["2107", "2109", "2212", "2309", "2311", "2312", "2313", "2314",
+                               "2315", "5107"], {"line_style": "dot"}),
+    ("歩道・徒歩道", ["2103", "2213"], {"line_style": "dash"}),
+    ("鉄道", ["2301", "2302", "2303", "2304", "2305"], {"line_width": "0.5"}),
+    ("建物", ["3000", "3001", "3002", "3003", "3004"], {"line_width": "0.26"}),
+    ("水部", ["5101", "5102", "5103", "5104", "5105", "5106", "5111"],
+     {"line_color": "0,112,192,255"}),
+    ("地類界", ["6201", "6301", "6302", "6303"], {"line_style": "dot", "line_width": "0.15"}),
+    ("等高線（計曲線）", ["7101", "7105"], {"line_width": "0.25"}),
+    ("等高線（主曲線）", ["7102", "7106"], {"line_width": "0.15"}),
+    ("等高線（補助曲線）", ["7103", "7104", "7107", "7108"],
+     {"line_style": "dash", "line_width": "0.15"}),
 ]
 LINE_OTHER = "その他"
 
@@ -96,13 +109,23 @@ def standard_icons() -> dict[str, str]:
     return icons
 
 
-def point_renderer(icons: dict[str, str], icon_size: float):
+def symbol_layer_property(name: str):
+    """QgsSymbolLayer のプロパティ番号。QGIS 3.36 より前は QgsSymbolLayer.Property<名前>"""
+    return getattr(QgsSymbolLayer, f"Property{name}", None) or getattr(QgsSymbolLayer.Property, name)
+
+
+def point_renderer(icons: dict[str, str], icon_size: float, max_scale: float):
     fallback = b64(FALLBACK_SVG.encode("utf-8"))
     sl = QgsSvgMarkerSymbolLayer(fallback, icon_size)
-    sl.setSizeUnit(Qgis.RenderUnit.Millimeters)
+    sl.setSizeUnit(QgsUnitTypes.RenderMillimeters)
     pairs = ", ".join(f"{quote(code)}, {quote(data)}" for code, data in sorted(icons.items()))
     expr = f"coalesce(map_get(map({pairs}), {CODE_EXPR}), {quote(fallback)})"
-    sl.setDataDefinedProperty(QgsSymbolLayer.Property.Name, QgsProperty.fromExpression(expr))
+    sl.setDataDefinedProperty(symbol_layer_property("Name"), QgsProperty.fromExpression(expr))
+    if max_scale > 0:
+        # dmconverter はレンダラーだけを複製するので、レイヤの縮尺表示ではなく記号側で隠す。
+        # 凡例など縮尺の無い描画では表示する
+        sl.setDataDefinedProperty(symbol_layer_property("LayerEnabled"), QgsProperty.fromExpression(
+            f"coalesce(@map_scale, 0) <= {max_scale:g}"))
     category = QgsRendererCategory("地図記号", QgsMarkerSymbol([sl]), "地図記号（分類コードで切替）")
     return QgsCategorizedSymbolRenderer("'地図記号'", [category])
 
@@ -136,18 +159,24 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--icon-size", type=float, default=9.0,
                     help="地図記号のSVGキャンバスの表示サイズ（mm）。インクは指定値の3分の1程度")
+    ap.add_argument("--point-max-scale", type=float, default=10000,
+                    help="地図記号を表示する最小縮尺の分母（既定 10000 = 1:10,000 より大縮尺で表示）。"
+                         "0 で常に表示")
+    ap.add_argument("--out", default=STYLES, help="QML の出力先フォルダ（既定 styles/）")
     args = ap.parse_args()
 
     app = QgsApplication([], False)
     app.initQgis()
-    os.makedirs(STYLES, exist_ok=True)
+    os.makedirs(args.out, exist_ok=True)
 
     icons = standard_icons()
-    save_qml(point_renderer(icons, args.icon_size), "Point", os.path.join(STYLES, "dm_point.qml"))
-    print(f"点: 地図記号 {len(icons)}コード（それ以外は灰色の丸）")
-    save_qml(line_renderer(), "LineString", os.path.join(STYLES, "dm_line.qml"))
-    print(f"線: {len(LINE_GROUPS) + 1}分類（{'・'.join(g[0] for g in LINE_GROUPS)}・{LINE_OTHER}）")
-    save_qml(polygon_renderer(), "Polygon", os.path.join(STYLES, "dm_polygon.qml"))
+    save_qml(point_renderer(icons, args.icon_size, args.point_max_scale), "Point",
+             os.path.join(args.out, "dm_point.qml"))
+    scale = f"1:{args.point_max_scale:,.0f} より大縮尺で表示" if args.point_max_scale > 0 else "常に表示"
+    print(f"点: 地図記号 {len(icons)}コード（それ以外は灰色の丸）、{scale}")
+    save_qml(line_renderer(), "LineString", os.path.join(args.out, "dm_line.qml"))
+    print(f"線: {len(LINE_GROUPS) + 1}分類（{'、'.join(g[0] for g in LINE_GROUPS)}、{LINE_OTHER}）")
+    save_qml(polygon_renderer(), "Polygon", os.path.join(args.out, "dm_polygon.qml"))
     print("面: 1分類（輪郭のみ）")
     app.exitQgis()
 
